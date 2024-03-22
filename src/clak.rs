@@ -323,3 +323,137 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use super::*;
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq, Hash)]
+    struct TestAddress(pub String);
+
+    impl Display for TestAddress {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Display::fmt(&self.0, f)
+        }
+    }
+
+    impl Address for TestAddress {}
+
+    #[derive(Debug, Default)]
+    struct TestTransportInner {
+        incoming_messages: VecDeque<(Message<TestAddress>, TestAddress)>,
+        outcoming_messages: VecDeque<(Message<TestAddress>, TestAddress)>,
+    }
+
+    #[derive(Debug, Default, Clone)]
+    struct TestTransport {
+        address: TestAddress,
+        inner: Arc<Mutex<TestTransportInner>>,
+    }
+
+    impl Transport for TestTransport {
+        type TransportAddress = TestAddress;
+
+        type Error = String;
+
+        async fn bind(address: Self::TransportAddress) -> Result<Self, Self::Error> {
+            Ok(TestTransport {
+                address,
+                ..Default::default()
+            })
+        }
+
+        async fn next(&self) -> Option<(Message<Self::TransportAddress>, Self::TransportAddress)> {
+            self.inner.lock().await.incoming_messages.pop_front()
+        }
+
+        async fn send(
+            &self,
+            msg: &Message<Self::TransportAddress>,
+            target: &Self::TransportAddress,
+        ) -> Result<usize, Self::Error> {
+            self.inner
+                .lock()
+                .await
+                .outcoming_messages
+                .push_back((msg.clone(), target.clone()));
+
+            Ok(1)
+        }
+
+        fn address(&self) -> Self::TransportAddress {
+            self.address.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_join() {
+        let mut node: Clak<TestTransport> = Clak::new(ClakConfig {
+            address: TestAddress("node1".into()),
+            protocol_period: Duration::from_secs(1),
+            protocol_timeout: Duration::from_millis(300),
+            ping_req_group_size: 3,
+        })
+        .await
+        .unwrap();
+
+        let members = node.members.clone();
+        let transport = node.transport.clone();
+
+        tokio::spawn(async move {
+            node.join(&TestAddress("node2".into())).await;
+        });
+
+        transport
+            .inner
+            .lock()
+            .await
+            .incoming_messages
+            .push_back((Message::JoinSuccess, TestAddress("node2".into())));
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert_eq!(
+            transport.inner.lock().await.outcoming_messages[0],
+            (
+                Message::Ack(TestAddress("node1".into())),
+                TestAddress("node2".into()),
+            ),
+        );
+
+        assert!(members
+            .lock()
+            .await
+            .get(&TestAddress("node2".into()))
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ping_add_member() {
+        let mut node: Clak<TestTransport> = Clak::new(ClakConfig {
+            address: TestAddress("node1".into()),
+            protocol_period: Duration::from_secs(1),
+            protocol_timeout: Duration::from_millis(300),
+            ping_req_group_size: 3,
+        })
+        .await
+        .unwrap();
+
+        let members = node.members.clone();
+        let transport = node.transport.clone();
+
+        tokio::spawn(async move {
+            node.run().await;
+        });
+
+        transport.inner.lock().await.incoming_messages.push_back((Message::Ping, TestAddress("node2".into())));
+
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+
+        assert!(members.lock().await.contains_key(&TestAddress("node2".into())));
+    }
+}

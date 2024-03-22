@@ -38,6 +38,4 @@ async fn main() {
     } else {
         clak.run().await;
     }
-
-    clak.run().await;
 }
