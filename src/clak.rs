@@ -13,7 +13,7 @@ use tokio::sync::{
 
 use crate::{
     member::{Member, MemberState},
-    message::Message,
+    message::{Gossip, Gossips, Message, OverheardGossips},
     transport::Transport,
     Address,
 };
@@ -23,6 +23,8 @@ pub struct ClakConfig<A: Address> {
     pub protocol_period: Duration,
     pub protocol_timeout: Duration,
     pub ping_req_group_size: usize,
+    pub gossip_max_age: usize,
+    pub gossip_overheard_size: usize,
 }
 
 pub struct Clak<T: Transport> {
@@ -31,11 +33,13 @@ pub struct Clak<T: Transport> {
         Mutex<HashMap<T::TransportAddress, (Sender<T::TransportAddress>, T::TransportAddress)>>,
     >,
     indirect_pings: Arc<Mutex<HashMap<T::TransportAddress, Sender<T::TransportAddress>>>>,
+    gossips: Arc<Mutex<Gossips<T::TransportAddress>>>,
     transport: T,
 
     protocol_period: Duration,
     protocol_timeout: Duration,
     ping_req_group_size: usize,
+    gossip_overheard_size: usize,
 }
 
 impl<T> Clak<T>
@@ -53,6 +57,8 @@ where
             ping_req_group_size: config.ping_req_group_size,
             direct_pings: Default::default(),
             indirect_pings: Default::default(),
+            gossip_overheard_size: config.gossip_overheard_size,
+            gossips: Arc::new(Mutex::new(Gossips::new(config.gossip_max_age))),
         })
     }
 
@@ -83,7 +89,7 @@ where
                     log::debug!(target: "clak", "{ping_address} alive");
                     continue;
                 }
-                MemberState::Suspicious => (),
+                MemberState::Suspicious | MemberState::Dead => (),
             }
 
             let ping_req_addresses: Vec<_> = self
@@ -106,9 +112,8 @@ where
                     log::debug!(target: "clak", "{ping_address} alive");
                     continue;
                 }
-                MemberState::Suspicious => {
-                    self.members.lock().await.remove(&ping_address);
-                    log::info!("❌ {ping_address} disconnected");
+                MemberState::Suspicious | MemberState::Dead => {
+                    self.dead_member(ping_address).await;
                 }
             }
         }
@@ -128,7 +133,13 @@ where
             .await
             .insert(ping_address.clone(), (tx, response_address));
 
-        match self.transport.send(&Message::Ping, &address).await {
+        let overheard_gossips = self.get_gossips().await;
+
+        match self
+            .transport
+            .send(&Message::Ping(overheard_gossips), &address)
+            .await
+        {
             Ok(_) => log::debug!(target: "clak", "ping {address}"),
             Err(e) => log::error!(target: "clak", "❗️ failed to ping {address}: {e}"),
         };
@@ -155,9 +166,14 @@ where
             .insert(ping_address.clone(), tx);
 
         for address in ping_req_addresses {
+            let overheard_gossips = self.get_gossips().await;
+
             match self
                 .transport
-                .send(&Message::PingReq(ping_address.clone()), address)
+                .send(
+                    &Message::PingReq(ping_address.clone(), overheard_gossips),
+                    address,
+                )
                 .await
             {
                 Ok(_) => log::debug!(target: "clak", "ping {address}"),
@@ -166,6 +182,11 @@ where
         }
 
         self.wait_for_ack(address, rx).await
+    }
+
+    async fn get_gossips(&self) -> Vec<Gossip<T::TransportAddress>> {
+        let mut gossips = self.gossips.lock().await;
+        gossips.take(self.gossip_overheard_size)
     }
 
     async fn wait_for_ack(
@@ -189,6 +210,7 @@ where
                 }
             },
             _ = tokio::time::sleep(self.protocol_timeout) => {
+                log::debug!(target: "clack", "sus");
                 MemberState::Suspicious
             }
         }
@@ -206,7 +228,10 @@ where
 
     pub async fn join(&mut self, target: &<T as Transport>::TransportAddress) {
         self.transport
-            .send(&Message::Ack(self.transport.address()), target)
+            .send(
+                &Message::Ack(self.transport.address(), self.get_gossips().await),
+                target,
+            )
             .await
             .expect("could not join");
 
@@ -226,14 +251,40 @@ where
 
         let res = match msg {
             Message::JoinSuccess => self.handle_join_success(from).await,
-            Message::Ping => self.handle_ping(from).await,
-            Message::PingReq(address) => self.handle_ping_req(address, from).await,
-            Message::Ack(address) => self.handle_ack(address).await,
+            Message::Ping(gossips) => self.handle_ping(from, gossips).await,
+            Message::PingReq(address, gossips) => {
+                self.handle_ping_req(address, from, gossips).await
+            }
+            Message::Ack(address, gossips) => self.handle_ack(address, gossips).await,
         };
 
         match res {
             Ok(_) => {}
             Err(e) => log::error!(target: "clak", "error while handling msg: {e}"),
+        }
+    }
+
+    async fn process_gossips(&self, overheard_gossips: OverheardGossips<T::TransportAddress>) {
+        for gossip in overheard_gossips.into_iter() {
+            let address = gossip.member.address().clone();
+            if address != self.transport.address() {
+                let is_known = self.members.lock().await.contains_key(&address);
+                match gossip.state {
+                    MemberState::Alive => {
+                        if !is_known {
+                            self.gossips.lock().await.push(gossip);
+                            self.new_member(address).await;
+                        }
+                    }
+                    MemberState::Dead => {
+                        if is_known {
+                            self.gossips.lock().await.push(gossip);
+                            self.dead_member(address).await
+                        }
+                    }
+                    MemberState::Suspicious => (),
+                };
+            }
         }
     }
 
@@ -243,8 +294,7 @@ where
     ) -> Result<(), <T as Transport>::Error> {
         match self.transport.send(&Message::JoinSuccess, &address).await {
             Ok(_) => {
-                log::info!(target: "clak", "🎉 member joined: {address}");
-                self.new_member(address).await;
+                self.new_member(address.clone()).await;
 
                 Ok(())
             }
@@ -257,10 +307,29 @@ where
     }
 
     async fn new_member(&self, address: <T as Transport>::TransportAddress) {
+        log::info!(target: "clak", "🎉 member joined: {address}");
+
         self.members
             .lock()
             .await
-            .insert(address.clone(), Member::new(address));
+            .insert(address.clone(), Member::new(address.clone()));
+
+        self.gossips
+            .lock()
+            .await
+            .push(Gossip::new(Member::new(address), MemberState::Alive));
+    }
+
+    async fn dead_member(&self, address: <T as Transport>::TransportAddress) {
+        if self.members.lock().await.contains_key(&address) {
+            log::info!(target: "clak", "❌ {address} disconnected");
+        }
+
+        self.members.lock().await.remove(&address);
+        self.gossips
+            .lock()
+            .await
+            .push(Gossip::new(Member::new(address), MemberState::Dead));
     }
 
     async fn handle_join_success(
@@ -279,11 +348,18 @@ where
     async fn handle_ping(
         &self,
         to: <T as Transport>::TransportAddress,
+        gossips: OverheardGossips<T::TransportAddress>,
     ) -> Result<(), <T as Transport>::Error> {
-        log::debug!("ping from {to}");
+        log::debug!(target: "clak", "ping from {to}");
+
+        self.process_gossips(gossips).await;
+        let overheard_gossips = self.get_gossips().await;
 
         self.transport
-            .send(&Message::Ack(self.transport.address()), &to)
+            .send(
+                &Message::Ack(self.transport.address(), overheard_gossips),
+                &to,
+            )
             .await?;
 
         Ok(())
@@ -293,8 +369,11 @@ where
         &self,
         ping_address: T::TransportAddress,
         response_address: T::TransportAddress,
+        overheard_gossips: OverheardGossips<T::TransportAddress>,
     ) -> Result<(), <T as Transport>::Error> {
-        log::debug!("ping request {response_address} -> {ping_address}");
+        log::debug!(target: "clak", "ping request {response_address} -> {ping_address}");
+
+        self.process_gossips(overheard_gossips).await;
 
         self.direct_probe(&ping_address, response_address).await;
 
@@ -304,18 +383,24 @@ where
     async fn handle_ack(
         &self,
         address: <T as Transport>::TransportAddress,
+        overheard_gossips: OverheardGossips<T::TransportAddress>,
     ) -> Result<(), <T as Transport>::Error> {
+        self.process_gossips(overheard_gossips).await;
+
         if let Some((tx, response_address)) =
             self.direct_pings.clone().lock().await.remove(&address)
         {
             // notify another member who requested this ping.
             if self.transport.address() != response_address {
                 self.transport
-                    .send(&Message::Ack(address.clone()), &response_address)
+                    .send(
+                        &Message::Ack(address.clone(), self.get_gossips().await),
+                        &response_address,
+                    )
                     .await?;
             }
 
-            if let Err(_) = tx.send(address) {
+            if tx.send(address).is_err() {
                 // channel closed
             };
         }
@@ -395,6 +480,8 @@ mod tests {
             protocol_period: Duration::from_secs(1),
             protocol_timeout: Duration::from_millis(300),
             ping_req_group_size: 3,
+            gossip_max_age: 5,
+            gossip_overheard_size: 5,
         })
         .await
         .unwrap();
@@ -419,7 +506,7 @@ mod tests {
         assert_eq!(
             transport.inner.lock().await.outcoming_messages[0],
             (
-                Message::Ack(TestAddress("node1".into())),
+                Message::Ack(TestAddress("node1".into()), vec![]),
                 TestAddress("node2".into()),
             ),
         );
@@ -438,6 +525,8 @@ mod tests {
             protocol_period: Duration::from_secs(1),
             protocol_timeout: Duration::from_millis(300),
             ping_req_group_size: 3,
+            gossip_max_age: 5,
+            gossip_overheard_size: 5,
         })
         .await
         .unwrap();
@@ -449,11 +538,19 @@ mod tests {
             node.run().await;
         });
 
-        transport.inner.lock().await.incoming_messages.push_back((Message::Ping, TestAddress("node2".into())));
+        transport
+            .inner
+            .lock()
+            .await
+            .incoming_messages
+            .push_back((Message::Ping(Vec::new()), TestAddress("node2".into())));
 
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(1)).await;
 
-        assert!(members.lock().await.contains_key(&TestAddress("node2".into())));
+        assert!(members
+            .lock()
+            .await
+            .contains_key(&TestAddress("node2".into())));
     }
 }

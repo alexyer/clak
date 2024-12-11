@@ -58,30 +58,6 @@ impl TcpAddress {
     }
 }
 
-// pub struct TcpTransport {
-//     listener: TcpListener,
-// }
-
-// impl Transport for TcpTransport {
-//     type TransportAddress = TcpAddress;
-//     type Error = io::Error;
-
-//     async fn bind(address: Self::TransportAddress) -> Result<Self, Self::Error> {
-//         let listener = TcpListener::bind(address.to_string()).await?;
-
-//         log::info!(target: "tcp-transport", "📞 Listening on {}", address);
-
-//         Ok(Self { listener })
-//     }
-
-//     async fn run(&self) {
-//         match self.listener.accept().await {
-//             Ok((_, addr)) => log::info!(target: "tcp-transport", "🎉 new client: {}", addr),
-//             Err(e) => log::error!(target: "tcp-transport", "❗️ failed to accept connection: {}", e),
-//         }
-//     }
-// }
-
 pub struct UdpTransport {
     socket: UdpSocket,
 }

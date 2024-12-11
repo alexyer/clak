@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 use crate::Address;
 
-pub(crate) struct Member<A: Address> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member<A: Address> {
     address: A,
 }
 
@@ -17,7 +20,9 @@ where
     }
 }
 
-pub(crate) enum MemberState {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberState {
     Alive,
     Suspicious,
+    Dead,
 }

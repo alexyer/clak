@@ -20,6 +20,8 @@ async fn main() {
         protocol_period: Duration::from_secs(1),
         protocol_timeout: Duration::from_millis(300),
         ping_req_group_size: 3,
+        gossip_max_age: 10,
+        gossip_overheard_size: 10,
     })
     .await
     .unwrap();
