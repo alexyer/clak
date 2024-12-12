@@ -1,4 +1,5 @@
 mod clak;
+pub mod event;
 mod member;
 mod message;
 pub mod transport;

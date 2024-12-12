@@ -7,16 +7,43 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot::{channel, Receiver, Sender},
     Mutex,
 };
 
 use crate::{
+    event::Event,
     member::{Member, MemberState},
     message::{Gossip, Gossips, Message, OverheardGossips},
     transport::Transport,
     Address,
 };
+
+pub type ClakEvent<T> = Event<<T as Transport>::TransportAddress>;
+pub type ClakEventTx<T> = UnboundedSender<ClakEvent<T>>;
+pub type ClakEventRx<T> = UnboundedReceiver<ClakEvent<T>>;
+pub type ClakSubscriptions<T> = Arc<Mutex<Vec<ClakEventTx<T>>>>;
+
+type Shared<T> = Arc<Mutex<T>>;
+
+pub type DirectPings<T> = Shared<
+    HashMap<
+        <T as Transport>::TransportAddress,
+        (
+            Sender<<T as Transport>::TransportAddress>,
+            <T as Transport>::TransportAddress,
+        ),
+    >,
+>;
+
+pub type IndirectPings<T> =
+    Shared<HashMap<<T as Transport>::TransportAddress, Sender<<T as Transport>::TransportAddress>>>;
+
+pub type Members<T> =
+    Shared<HashMap<<T as Transport>::TransportAddress, Member<<T as Transport>::TransportAddress>>>;
+
+pub type ClakGossips<T> = Shared<Gossips<<T as Transport>::TransportAddress>>;
 
 pub struct ClakConfig<A: Address> {
     pub address: A,
@@ -28,18 +55,17 @@ pub struct ClakConfig<A: Address> {
 }
 
 pub struct Clak<T: Transport> {
-    members: Arc<Mutex<HashMap<T::TransportAddress, Member<T::TransportAddress>>>>,
-    direct_pings: Arc<
-        Mutex<HashMap<T::TransportAddress, (Sender<T::TransportAddress>, T::TransportAddress)>>,
-    >,
-    indirect_pings: Arc<Mutex<HashMap<T::TransportAddress, Sender<T::TransportAddress>>>>,
-    gossips: Arc<Mutex<Gossips<T::TransportAddress>>>,
+    members: Members<T>,
+    direct_pings: DirectPings<T>,
+    indirect_pings: IndirectPings<T>,
+    gossips: ClakGossips<T>,
     transport: T,
 
     protocol_period: Duration,
     protocol_timeout: Duration,
     ping_req_group_size: usize,
     gossip_overheard_size: usize,
+    subscriptions: ClakSubscriptions<T>,
 }
 
 impl<T> Clak<T>
@@ -59,7 +85,23 @@ where
             indirect_pings: Default::default(),
             gossip_overheard_size: config.gossip_overheard_size,
             gossips: Arc::new(Mutex::new(Gossips::new(config.gossip_max_age))),
+            subscriptions: Default::default(),
         })
+    }
+
+    pub async fn subscribe(&mut self) -> ClakEventRx<T> {
+        let (tx, rx) = unbounded_channel();
+        self.subscriptions.lock().await.push(tx);
+
+        rx
+    }
+
+    /// Get current list of connected members.
+    ///
+    /// The method is inefficient and advised against use.
+    /// It's better to rely on subscription for members discovery.
+    pub async fn members(&self) -> Vec<Member<T::TransportAddress>> {
+        self.members.lock().await.values().cloned().collect()
     }
 
     pub async fn run(&mut self) {
@@ -210,7 +252,6 @@ where
                 }
             },
             _ = tokio::time::sleep(self.protocol_timeout) => {
-                log::debug!(target: "clack", "sus");
                 MemberState::Suspicious
             }
         }
@@ -306,6 +347,17 @@ where
         }
     }
 
+    async fn notify(&self, event: &ClakEvent<T>) {
+        self.subscriptions.lock().await.retain(|tx| {
+            if let Err(e) = tx.send(event.clone()) {
+                log::error!(target: "clak", "❗️ Closed subscription channel: {}", e);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     async fn new_member(&self, address: <T as Transport>::TransportAddress) {
         log::info!(target: "clak", "🎉 member joined: {address}");
 
@@ -314,22 +366,25 @@ where
             .await
             .insert(address.clone(), Member::new(address.clone()));
 
-        self.gossips
-            .lock()
-            .await
-            .push(Gossip::new(Member::new(address), MemberState::Alive));
+        let gossip = Gossip::new(Member::new(address), MemberState::Alive);
+
+        self.notify(&Event::try_from(&gossip).unwrap()).await;
+
+        self.gossips.lock().await.push(gossip);
     }
 
     async fn dead_member(&self, address: <T as Transport>::TransportAddress) {
         if self.members.lock().await.contains_key(&address) {
-            log::info!(target: "clak", "❌ {address} disconnected");
+            log::info!(target: "clak", "💀 {address} disconnected");
         }
 
         self.members.lock().await.remove(&address);
-        self.gossips
-            .lock()
-            .await
-            .push(Gossip::new(Member::new(address), MemberState::Dead));
+
+        let gossip = Gossip::new(Member::new(address), MemberState::Dead);
+
+        self.notify(&Event::try_from(&gossip).unwrap()).await;
+
+        self.gossips.lock().await.push(gossip);
     }
 
     async fn handle_join_success(
